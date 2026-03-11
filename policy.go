@@ -76,11 +76,13 @@ type RuleMatch struct {
 }
 
 // ---------------------------------------------------------------------------
-// Policy engine
+// Policy engine — deny-first precedence
 // ---------------------------------------------------------------------------
 
 // PolicyEngine evaluates retrieval requests against ordered rules.
-// First matching rule wins (firewall-style).
+// Deny rules are always evaluated first regardless of position in the
+// rule list, ensuring security-critical blocks cannot be bypassed by
+// an allow rule that appears earlier.
 type PolicyEngine struct {
 	defaultAction string
 	rules         []Rule
@@ -98,8 +100,29 @@ func NewPolicyEngine(defaultAction string, rules []Rule) *PolicyEngine {
 }
 
 // EvaluateChunk evaluates a single chunk against the policy for a given request.
+// Uses deny-first precedence: all deny rules are checked before any allow/redact rules.
 func (e *PolicyEngine) EvaluateChunk(chunk Chunk, docSource string, req RetrievalRequest) ChunkDecision {
+	// Pass 1: Deny rules take priority — any matching deny rule blocks immediately.
 	for _, rule := range e.rules {
+		if rule.Action != "deny" {
+			continue
+		}
+		if matchesRule(chunk, docSource, req, rule.Match) {
+			return ChunkDecision{
+				ChunkID:  chunk.ID,
+				Action:   "deny",
+				Rule:     rule.Name,
+				Reason:   rule.Reason,
+				Evidence: buildEvidence(chunk, docSource, req, rule),
+			}
+		}
+	}
+
+	// Pass 2: Non-deny rules in config order (require-approval, redact, allow).
+	for _, rule := range e.rules {
+		if rule.Action == "deny" {
+			continue
+		}
 		if matchesRule(chunk, docSource, req, rule.Match) {
 			decision := ChunkDecision{
 				ChunkID:  chunk.ID,
@@ -108,7 +131,6 @@ func (e *PolicyEngine) EvaluateChunk(chunk Chunk, docSource string, req Retrieva
 				Reason:   rule.Reason,
 				Evidence: buildEvidence(chunk, docSource, req, rule),
 			}
-
 			switch rule.Action {
 			case "allow":
 				decision.Content = chunk.Content

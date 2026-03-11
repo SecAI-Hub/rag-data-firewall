@@ -3,8 +3,9 @@ version: 1
 # Default action when no rule matches (deny-by-default).
 default_action: deny
 
-# Rules are evaluated in order. First match wins (firewall semantics).
-# Place deny rules before allow rules for defense-in-depth.
+# Rules are evaluated with deny-first precedence:
+# All deny rules are checked first regardless of position in the list,
+# then non-deny rules are evaluated in order.
 rules:
   # --- Safety rules (highest priority) ---
 
@@ -97,6 +98,15 @@ data_dir: /var/lib/secure-ai/rag
 # Daemon settings
 daemon:
   bind_addr: "127.0.0.1:8500"
+  read_timeout_seconds: 30
+  write_timeout_seconds: 60
+  idle_timeout_seconds: 120
+
+# Retention controls
+retention:
+  max_documents: 10000
+  max_total_chunks: 100000
+  ttl_days: 90
 
 # Rate limiting
 rate_limit:

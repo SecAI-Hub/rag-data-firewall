@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -21,17 +23,21 @@ import (
 // ---------------------------------------------------------------------------
 
 type FirewallPolicy struct {
-	Version       int           `yaml:"version"`
-	DefaultAction string        `yaml:"default_action"`
-	Rules         []Rule        `yaml:"rules"`
-	Scanner       ScannerConfig `yaml:"scanner"`
-	DataDir       string        `yaml:"data_dir"`
-	Daemon        DaemonConfig  `yaml:"daemon"`
-	RateLimit     RateLimitCfg  `yaml:"rate_limit"`
+	Version       int             `yaml:"version"`
+	DefaultAction string          `yaml:"default_action"`
+	Rules         []Rule          `yaml:"rules"`
+	Scanner       ScannerConfig   `yaml:"scanner"`
+	DataDir       string          `yaml:"data_dir"`
+	Daemon        DaemonConfig    `yaml:"daemon"`
+	RateLimit     RateLimitCfg    `yaml:"rate_limit"`
+	Retention     RetentionConfig `yaml:"retention"`
 }
 
 type DaemonConfig struct {
-	BindAddr string `yaml:"bind_addr"`
+	BindAddr        string `yaml:"bind_addr"`
+	ReadTimeoutSec  int    `yaml:"read_timeout_seconds"`
+	WriteTimeoutSec int    `yaml:"write_timeout_seconds"`
+	IdleTimeoutSec  int    `yaml:"idle_timeout_seconds"`
 }
 
 type RateLimitCfg struct {
@@ -49,9 +55,10 @@ var (
 
 	docStore *DocumentStore
 
-	auditFile *os.File
-	auditMu   sync.Mutex
-	auditPath string
+	auditFile     *os.File
+	auditMu       sync.Mutex
+	auditPath     string
+	auditLastHash string
 
 	rateMu      sync.Mutex
 	rateCounter int64
@@ -65,12 +72,12 @@ var (
 )
 
 const (
-	defaultPolicyPath = "/etc/secure-ai/policy/rag-firewall.yaml"
-	defaultTokenPath  = "/run/secure-ai/service-token"
-	defaultAuditPath  = "/var/lib/secure-ai/logs/rag-firewall-audit.jsonl"
-	defaultDataDir    = "/var/lib/secure-ai/rag"
-	defaultBindAddr   = "127.0.0.1:8500"
-	defaultRPM        = 120
+	defaultPolicyPath  = "/etc/secure-ai/policy/rag-firewall.yaml"
+	defaultTokenPath   = "/run/secure-ai/service-token"
+	defaultAuditPath   = "/var/lib/secure-ai/logs/rag-firewall-audit.jsonl"
+	defaultDataDir     = "/var/lib/secure-ai/rag"
+	defaultBindAddr    = "127.0.0.1:8500"
+	defaultRPM         = 120
 	maxRequestBodySize = 10 << 20 // 10 MiB (documents can be large)
 )
 
@@ -127,7 +134,7 @@ func getDataDir() string {
 }
 
 // ---------------------------------------------------------------------------
-// Audit logging
+// Tamper-evident audit logging (hash chain)
 // ---------------------------------------------------------------------------
 
 type AuditEntry struct {
@@ -136,6 +143,8 @@ type AuditEntry struct {
 	Allowed   int    `json:"allowed,omitempty"`
 	Denied    int    `json:"denied,omitempty"`
 	Detail    string `json:"detail,omitempty"`
+	Hash      string `json:"hash"`
+	PrevHash  string `json:"prev_hash,omitempty"`
 }
 
 func initAuditLog() {
@@ -147,6 +156,22 @@ func initAuditLog() {
 	if idx > 0 {
 		os.MkdirAll(auditPath[:idx], 0750)
 	}
+
+	// Load last hash from existing audit log for chain continuity.
+	if data, err := os.ReadFile(auditPath); err == nil {
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			if lines[i] == "" {
+				continue
+			}
+			var entry AuditEntry
+			if err := json.Unmarshal([]byte(lines[i]), &entry); err == nil {
+				auditLastHash = entry.Hash
+				break
+			}
+		}
+	}
+
 	f, err := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
 	if err != nil {
 		log.Printf("warning: cannot open audit log: %v", err)
@@ -155,15 +180,42 @@ func initAuditLog() {
 	auditFile = f
 }
 
+// computeAuditHash returns a SHA-256 digest over all fields except Hash.
+func computeAuditHash(entry AuditEntry) string {
+	canonical := struct {
+		Timestamp string `json:"timestamp"`
+		Action    string `json:"action"`
+		Allowed   int    `json:"allowed,omitempty"`
+		Denied    int    `json:"denied,omitempty"`
+		Detail    string `json:"detail,omitempty"`
+		PrevHash  string `json:"prev_hash,omitempty"`
+	}{
+		Timestamp: entry.Timestamp,
+		Action:    entry.Action,
+		Allowed:   entry.Allowed,
+		Denied:    entry.Denied,
+		Detail:    entry.Detail,
+		PrevHash:  entry.PrevHash,
+	}
+	data, _ := json.Marshal(canonical)
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:])
+}
+
 func writeAudit(entry AuditEntry) {
 	if auditFile == nil {
 		return
 	}
 	entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	entry.PrevHash = auditLastHash
+	entry.Hash = computeAuditHash(entry)
+	auditLastHash = entry.Hash
+
 	data, _ := json.Marshal(entry)
 	auditMu.Lock()
 	defer auditMu.Unlock()
 	auditFile.Write(append(data, '\n'))
+	auditFile.Sync()
 }
 
 // ---------------------------------------------------------------------------
@@ -192,20 +244,26 @@ func requireServiceToken(next http.HandlerFunc) http.HandlerFunc {
 		}
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]string{"error": "forbidden: invalid service token"})
+			jsonError(w, "forbidden: invalid service token", http.StatusForbidden)
 			return
 		}
 		token := strings.TrimPrefix(auth, "Bearer ")
 		if subtle.ConstantTimeCompare([]byte(token), []byte(serviceToken)) != 1 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]string{"error": "forbidden: invalid service token"})
+			jsonError(w, "forbidden: invalid service token", http.StatusForbidden)
 			return
 		}
 		next(w, r)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Consistent JSON error responses
+// ---------------------------------------------------------------------------
+
+func jsonError(w http.ResponseWriter, msg string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 // ---------------------------------------------------------------------------
@@ -249,11 +307,11 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 	ingestRequests.Add(1)
 
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if !checkRateLimit() {
-		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		jsonError(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
 
@@ -261,11 +319,12 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 
 	var req IngestRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		jsonError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
-	if req.Name == "" || req.Content == "" {
-		http.Error(w, "name and content are required", http.StatusBadRequest)
+
+	if err := validateIngestRequest(req); err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -273,7 +332,7 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 	doc, chunks, err := docStore.Ingest(req, pol.Scanner)
 	if err != nil {
 		log.Printf("ingest error: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -304,11 +363,11 @@ func handleRetrieve(w http.ResponseWriter, r *http.Request) {
 	retrieveRequests.Add(1)
 
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if !checkRateLimit() {
-		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		jsonError(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
 
@@ -316,7 +375,12 @@ func handleRetrieve(w http.ResponseWriter, r *http.Request) {
 
 	var req RetrievalRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if err := validateRetrievalRequest(req); err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -327,7 +391,7 @@ func handleRetrieve(w http.ResponseWriter, r *http.Request) {
 		req.SessionTrust = "medium"
 	}
 
-	// Gather candidate chunks.
+	// Gather candidate chunks with tightened scoping.
 	var candidates []Chunk
 	if len(req.ChunkIDs) > 0 {
 		for _, cid := range req.ChunkIDs {
@@ -339,8 +403,12 @@ func handleRetrieve(w http.ResponseWriter, r *http.Request) {
 		for _, did := range req.DocumentIDs {
 			candidates = append(candidates, docStore.QueryChunks(ChunkFilter{DocumentID: did})...)
 		}
-	} else {
+	} else if req.RequesterType == "system" {
+		// Only system-trust callers may retrieve all chunks (unscoped).
 		candidates = docStore.AllChunks()
+	} else {
+		jsonError(w, "retrieval requires explicit chunk_ids or document_ids", http.StatusBadRequest)
+		return
 	}
 
 	// Build doc source lookup.
@@ -371,7 +439,7 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	totalRequests.Add(1)
 
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -381,11 +449,11 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		Content string `json:"content"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		jsonError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 	if req.Content == "" {
-		http.Error(w, "content is required", http.StatusBadRequest)
+		jsonError(w, "content is required", http.StatusBadRequest)
 		return
 	}
 
@@ -395,25 +463,43 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(result)
 }
 
-func handleListDocuments(w http.ResponseWriter, r *http.Request) {
+func handleDocuments(w http.ResponseWriter, r *http.Request) {
 	totalRequests.Add(1)
 
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+	switch r.Method {
+	case http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"documents": docStore.ListDocuments(),
+		})
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"documents": docStore.ListDocuments(),
-	})
+	case http.MethodDelete:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			jsonError(w, "id parameter is required", http.StatusBadRequest)
+			return
+		}
+		if err := docStore.DeleteDocument(id); err != nil {
+			jsonError(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		writeAudit(AuditEntry{
+			Action: "delete",
+			Detail: fmt.Sprintf("doc=%s", id),
+		})
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "deleted", "id": id})
+
+	default:
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func handleListChunks(w http.ResponseWriter, r *http.Request) {
 	totalRequests.Add(1)
 
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -437,13 +523,11 @@ func handleReload(w http.ResponseWriter, r *http.Request) {
 	totalRequests.Add(1)
 
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if err := loadPolicy(); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -462,6 +546,23 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
+// Mux builder (exported for testability)
+// ---------------------------------------------------------------------------
+
+func buildMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", handleHealth)
+	mux.HandleFunc("/v1/ingest", requireServiceToken(handleIngest))
+	mux.HandleFunc("/v1/retrieve", requireServiceToken(handleRetrieve))
+	mux.HandleFunc("/v1/scan", requireServiceToken(handleScan))
+	mux.HandleFunc("/v1/documents", requireServiceToken(handleDocuments))
+	mux.HandleFunc("/v1/chunks", requireServiceToken(handleListChunks))
+	mux.HandleFunc("/v1/reload", requireServiceToken(handleReload))
+	mux.HandleFunc("/v1/metrics", requireServiceToken(handleMetrics))
+	return mux
+}
+
+// ---------------------------------------------------------------------------
 // Daemon
 // ---------------------------------------------------------------------------
 
@@ -469,19 +570,31 @@ func runDaemon(bindAddr string) {
 	loadServiceToken()
 	initAuditLog()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", handleHealth)
-	mux.HandleFunc("/v1/ingest", requireServiceToken(handleIngest))
-	mux.HandleFunc("/v1/retrieve", handleRetrieve)
-	mux.HandleFunc("/v1/scan", handleScan)
-	mux.HandleFunc("/v1/documents", handleListDocuments)
-	mux.HandleFunc("/v1/chunks", handleListChunks)
-	mux.HandleFunc("/v1/reload", requireServiceToken(handleReload))
-	mux.HandleFunc("/v1/metrics", handleMetrics)
+	pol := getPolicy()
+	readTimeout := 30
+	writeTimeout := 60
+	idleTimeout := 120
+	if pol.Daemon.ReadTimeoutSec > 0 {
+		readTimeout = pol.Daemon.ReadTimeoutSec
+	}
+	if pol.Daemon.WriteTimeoutSec > 0 {
+		writeTimeout = pol.Daemon.WriteTimeoutSec
+	}
+	if pol.Daemon.IdleTimeoutSec > 0 {
+		idleTimeout = pol.Daemon.IdleTimeoutSec
+	}
+
+	srv := &http.Server{
+		Addr:         bindAddr,
+		Handler:      buildMux(),
+		ReadTimeout:  time.Duration(readTimeout) * time.Second,
+		WriteTimeout: time.Duration(writeTimeout) * time.Second,
+		IdleTimeout:  time.Duration(idleTimeout) * time.Second,
+	}
 
 	log.Printf("rag-data-firewall serving on %s (docs=%d chunks=%d)",
 		bindAddr, docStore.DocumentCount(), docStore.ChunkCount())
-	if err := http.ListenAndServe(bindAddr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
@@ -497,8 +610,9 @@ func cmdServe(policyPath, bindAddr string) int {
 		return 1
 	}
 
+	pol := getPolicy()
 	var err error
-	docStore, err = NewDocumentStore(getDataDir())
+	docStore, err = NewDocumentStore(getDataDir(), pol.Retention)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error opening store: %v\n", err)
 		return 1
@@ -506,7 +620,7 @@ func cmdServe(policyPath, bindAddr string) int {
 	defer docStore.Close()
 
 	if bindAddr == "" {
-		bindAddr = getPolicy().Daemon.BindAddr
+		bindAddr = pol.Daemon.BindAddr
 		if bindAddr == "" {
 			bindAddr = defaultBindAddr
 		}
@@ -523,8 +637,9 @@ func cmdIngest(policyPath, filePath, name, sensitivity, trust, source string, la
 		return 1
 	}
 
+	pol := getPolicy()
 	var err error
-	docStore, err = NewDocumentStore(getDataDir())
+	docStore, err = NewDocumentStore(getDataDir(), pol.Retention)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -550,7 +665,7 @@ func cmdIngest(policyPath, filePath, name, sensitivity, trust, source string, la
 		Labels:           labels,
 	}
 
-	doc, chunks, err := docStore.Ingest(req, getPolicy().Scanner)
+	doc, chunks, err := docStore.Ingest(req, pol.Scanner)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -592,8 +707,9 @@ func cmdQuery(policyPath, requesterType, sessionTrust, tool string, chunkIDs, do
 		return 1
 	}
 
+	pol := getPolicy()
 	var err error
-	docStore, err = NewDocumentStore(getDataDir())
+	docStore, err = NewDocumentStore(getDataDir(), pol.Retention)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
@@ -645,8 +761,9 @@ func cmdList(policyPath, what string) int {
 		return 1
 	}
 
+	pol := getPolicy()
 	var err error
-	docStore, err = NewDocumentStore(getDataDir())
+	docStore, err = NewDocumentStore(getDataDir(), pol.Retention)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
