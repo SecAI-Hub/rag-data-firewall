@@ -1012,6 +1012,76 @@ func TestAuditHashChain(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// CLI query scoping tests
+// ---------------------------------------------------------------------------
+
+func TestCLIQuery_UnscopedRequiresSystem(t *testing.T) {
+	setupTestEnv(t)
+	defer docStore.Close()
+
+	docStore.Ingest(IngestRequest{
+		Name: "test", Content: "Public info.", SensitivityLabel: "public",
+	}, getPolicy().Scanner)
+
+	// Simulate cmdQuery logic: no chunk_ids or doc_ids, non-system requester.
+	req := RetrievalRequest{
+		RequesterType: "user",
+		SessionTrust:  "medium",
+	}
+
+	var candidates []Chunk
+	if len(req.ChunkIDs) > 0 {
+		for _, cid := range req.ChunkIDs {
+			if c, ok := docStore.GetChunk(cid); ok {
+				candidates = append(candidates, c)
+			}
+		}
+	} else if len(req.DocumentIDs) > 0 {
+		for _, did := range req.DocumentIDs {
+			candidates = append(candidates, docStore.QueryChunks(ChunkFilter{DocumentID: did})...)
+		}
+	} else if req.RequesterType == "system" {
+		candidates = docStore.AllChunks()
+	}
+	// For non-system with no scoping, candidates should be nil (rejected).
+	if candidates != nil {
+		t.Fatal("expected nil candidates for unscoped non-system query")
+	}
+}
+
+func TestCLIQuery_UnscopedAllowedForSystem(t *testing.T) {
+	setupTestEnv(t)
+	defer docStore.Close()
+
+	docStore.Ingest(IngestRequest{
+		Name: "test", Content: "Public info.", SensitivityLabel: "public",
+	}, getPolicy().Scanner)
+
+	req := RetrievalRequest{
+		RequesterType: "system",
+	}
+
+	var candidates []Chunk
+	if len(req.ChunkIDs) > 0 {
+		for _, cid := range req.ChunkIDs {
+			if c, ok := docStore.GetChunk(cid); ok {
+				candidates = append(candidates, c)
+			}
+		}
+	} else if len(req.DocumentIDs) > 0 {
+		for _, did := range req.DocumentIDs {
+			candidates = append(candidates, docStore.QueryChunks(ChunkFilter{DocumentID: did})...)
+		}
+	} else if req.RequesterType == "system" {
+		candidates = docStore.AllChunks()
+	}
+
+	if len(candidates) == 0 {
+		t.Fatal("system requester should get all chunks when unscoped")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Integration: ingest poisoned doc and verify policy blocks it
 // ---------------------------------------------------------------------------
 

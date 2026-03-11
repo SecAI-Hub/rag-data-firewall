@@ -735,8 +735,12 @@ func cmdQuery(policyPath, requesterType, sessionTrust, tool string, chunkIDs, do
 		for _, did := range req.DocumentIDs {
 			candidates = append(candidates, docStore.QueryChunks(ChunkFilter{DocumentID: did})...)
 		}
-	} else {
+	} else if requesterType == "system" {
+		// Only system-trust callers may query all chunks (unscoped).
 		candidates = docStore.AllChunks()
+	} else {
+		fmt.Fprintf(os.Stderr, "error: unscoped query requires -requester=system (pass -chunks or -docs to scope)\n")
+		return 1
 	}
 
 	docSourceMap := make(map[string]string)
@@ -872,8 +876,17 @@ func main() {
 		requesterType := fs.String("requester", "user", "requester type (user, tool, system)")
 		sessionTrust := fs.String("session-trust", "medium", "session trust level")
 		tool := fs.String("tool", "", "requesting tool name")
+		chunks := fs.String("chunks", "", "comma-separated chunk IDs to scope retrieval")
+		docs := fs.String("docs", "", "comma-separated document IDs to scope retrieval")
 		fs.Parse(os.Args[2:])
-		os.Exit(cmdQuery(*policyPath, *requesterType, *sessionTrust, *tool, nil, nil))
+		var chunkIDs, docIDs []string
+		if *chunks != "" {
+			chunkIDs = strings.Split(*chunks, ",")
+		}
+		if *docs != "" {
+			docIDs = strings.Split(*docs, ",")
+		}
+		os.Exit(cmdQuery(*policyPath, *requesterType, *sessionTrust, *tool, chunkIDs, docIDs))
 
 	case "list":
 		fs := flag.NewFlagSet("list", flag.ExitOnError)
