@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -162,11 +163,18 @@ func detectDataExfil(content string) []string {
 
 var b64Pattern = regexp.MustCompile(`[A-Za-z0-9+/]{40,}={0,2}`)
 
+const maxBase64InspectionBytes = 64 << 10
+
 // detectBase64Injection checks for base64-encoded strings that decode
 // to prompt injection content.
 func detectBase64Injection(content string) bool {
-	matches := b64Pattern.FindAllString(content, 5) // limit checks
-	for _, m := range matches {
+	matches := b64Pattern.FindAllStringIndex(content, 5) // limit checks
+	for _, match := range matches {
+		if match[1]-match[0] > maxBase64InspectionBytes {
+			// Refuse to spend unbounded memory decoding an opaque embedded blob.
+			return true
+		}
+		m := content[match[0]:match[1]]
 		decoded, err := base64.StdEncoding.DecodeString(m)
 		if err != nil {
 			decoded, err = base64.URLEncoding.DecodeString(m)
@@ -211,6 +219,7 @@ func detectPII(content string) (bool, []string) {
 	for t := range typeSet {
 		types = append(types, t)
 	}
+	sort.Strings(types)
 	return true, types
 }
 
@@ -383,6 +392,12 @@ func RedactContent(content string, patterns []string) string {
 	filterSet := make(map[string]bool)
 	for _, p := range patterns {
 		filterSet[p] = true
+	}
+	if filterSet["credit_card"] {
+		filterSet["card"] = true
+	}
+	if filterSet["bearer_token"] {
+		filterSet["bearer"] = true
 	}
 
 	for _, rule := range piiRedactionRules {

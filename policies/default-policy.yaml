@@ -47,7 +47,7 @@ rules:
       sensitivity: [confidential]
       session_trust: [low]
     action: redact
-    redact_patterns: [email, ssn, phone, credential]
+    redact_patterns: [email, ssn, phone, credential, credit_card, bearer_token]
 
   - name: allow-confidential-high-trust
     description: "Allow confidential docs for high-trust user sessions"
@@ -62,7 +62,7 @@ rules:
     match:
       sensitivity: [confidential]
     action: redact
-    redact_patterns: [email, ssn, phone]
+    redact_patterns: [email, ssn, phone, credential, credit_card, bearer_token]
 
   - name: allow-internal-users
     description: "Internal documents available to users"

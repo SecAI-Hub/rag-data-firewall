@@ -1,18 +1,32 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"io"
+	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+const maxStoreFileSize int64 = 1024 * 1024 * 1024
+
+const (
+	hardMaxDocuments     = 100_000
+	hardMaxChunks        = 1_000_000
+	maxChunksPerDocument = 4096
+)
+
+var ErrDocumentNotFound = errors.New("document not found")
 
 // ---------------------------------------------------------------------------
 // Document and chunk types
@@ -22,11 +36,11 @@ import (
 type Document struct {
 	ID               string            `json:"id"`
 	Name             string            `json:"name"`
-	Source           string            `json:"source"`              // vault, upload, crawl, manual
-	SensitivityLabel string            `json:"sensitivity_label"`   // public, internal, confidential, restricted
-	TrustLevel       string            `json:"trust_level"`         // verified, unverified, untrusted
+	Source           string            `json:"source"`            // vault, upload, crawl, manual
+	SensitivityLabel string            `json:"sensitivity_label"` // public, internal, confidential, restricted
+	TrustLevel       string            `json:"trust_level"`       // verified, unverified, untrusted
 	IngestedAt       string            `json:"ingested_at"`
-	Labels           map[string]string `json:"labels,omitempty"`    // arbitrary key-value
+	Labels           map[string]string `json:"labels,omitempty"` // arbitrary key-value
 	ContentHash      string            `json:"content_hash"`
 	ChunkCount       int               `json:"chunk_count"`
 }
@@ -55,10 +69,12 @@ type RetentionConfig struct {
 // ID generation
 // ---------------------------------------------------------------------------
 
-func generateID() string {
+func generateID() (string, error) {
 	b := make([]byte, 8)
-	rand.Read(b)
-	return fmt.Sprintf("%d-%s", time.Now().UnixMilli(), hex.EncodeToString(b))
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate random ID: %w", err)
+	}
+	return fmt.Sprintf("%d-%s", time.Now().UnixMilli(), hex.EncodeToString(b)), nil
 }
 
 func hashContent(content string) string {
@@ -129,6 +145,23 @@ func splitParagraphs(content string) []string {
 	return parts
 }
 
+// validateChunkingCost rejects separator bombs before strings.Split can
+// allocate millions of substrings and before the scanner builds one result per
+// fragment. The request byte limit alone does not bound the number of chunks.
+func validateChunkingCost(content string) error {
+	normalized := strings.ReplaceAll(content, "\r\n", "\n")
+	if strings.Contains(normalized, "\n\n") {
+		if strings.Count(normalized, "\n\n")+1 > maxChunksPerDocument {
+			return fmt.Errorf("document would exceed %d chunks", maxChunksPerDocument)
+		}
+		return nil
+	}
+	if len(normalized) > 1000 && strings.Count(normalized, "\n")+1 > maxChunksPerDocument {
+		return fmt.Errorf("document would exceed %d chunks", maxChunksPerDocument)
+	}
+	return nil
+}
+
 func copyLabels(labels map[string]string) map[string]string {
 	if labels == nil {
 		return nil
@@ -153,16 +186,25 @@ type DocumentStore struct {
 	chunkByID map[string]int   // chunk ID -> index in chunks
 	docChunks map[string][]int // doc ID -> chunk indices
 
-	docFile   *os.File
-	chunkFile *os.File
 	dataDir   string
+	statePath string
+	stateInfo os.FileInfo
 	retention RetentionConfig
+}
+
+type persistedState struct {
+	Version   int        `json:"version"`
+	Documents []Document `json:"documents"`
+	Chunks    []Chunk    `json:"chunks"`
 }
 
 // NewDocumentStore creates or opens a document store with retention controls.
 func NewDocumentStore(dataDir string, retention RetentionConfig) (*DocumentStore, error) {
-	if err := os.MkdirAll(dataDir, 0750); err != nil {
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+	if err := ensurePrivateDirectory(dataDir); err != nil {
+		return nil, fmt.Errorf("secure data directory: %w", err)
 	}
 
 	store := &DocumentStore{
@@ -170,61 +212,156 @@ func NewDocumentStore(dataDir string, retention RetentionConfig) (*DocumentStore
 		chunkByID: make(map[string]int),
 		docChunks: make(map[string][]int),
 		dataDir:   dataDir,
+		statePath: filepath.Join(dataDir, "store.json"),
 		retention: retention,
 	}
 
-	// Load existing documents (corruption-tolerant: skip bad lines).
-	docPath := dataDir + "/documents.jsonl"
-	if data, err := os.ReadFile(docPath); err == nil {
-		for lineNum, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-			if line == "" {
-				continue
-			}
-			var d Document
-			if err := json.Unmarshal([]byte(line), &d); err != nil {
-				log.Printf("warning: skipping corrupt document at line %d: %v", lineNum+1, err)
-				continue
-			}
-			idx := len(store.documents)
-			store.documents = append(store.documents, d)
-			store.docIndex[d.ID] = idx
+	data, stateInfo, err := readRegularFileWithInfo(store.statePath, maxStoreFileSize)
+	if err == nil {
+		if stateInfo.Mode().Perm()&0077 != 0 || !hasSingleLink(stateInfo) {
+			return nil, fmt.Errorf("state file must be owner-only and have exactly one link")
+		}
+		store.stateInfo = stateInfo
+		var state persistedState
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&state); err != nil {
+			return nil, fmt.Errorf("load state: %w", err)
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			return nil, fmt.Errorf("load state: trailing JSON data")
+		}
+		if state.Version != 1 {
+			return nil, fmt.Errorf("unsupported state version %d", state.Version)
+		}
+		store.documents = state.Documents
+		store.chunks = state.Chunks
+	} else if os.IsNotExist(err) {
+		if err := store.loadLegacyState(); err != nil {
+			return nil, err
+		}
+	} else {
+		return nil, fmt.Errorf("load state: %w", err)
+	}
+	if err := store.rebuildIndexes(); err != nil {
+		return nil, err
+	}
+	if data == nil {
+		if err := store.persistState(store.documents, store.chunks); err != nil {
+			return nil, fmt.Errorf("migrate legacy state: %w", err)
 		}
 	}
-
-	// Load existing chunks (corruption-tolerant: skip bad lines).
-	chunkPath := dataDir + "/chunks.jsonl"
-	if data, err := os.ReadFile(chunkPath); err == nil {
-		for lineNum, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-			if line == "" {
-				continue
-			}
-			var c Chunk
-			if err := json.Unmarshal([]byte(line), &c); err != nil {
-				log.Printf("warning: skipping corrupt chunk at line %d: %v", lineNum+1, err)
-				continue
-			}
-			idx := len(store.chunks)
-			store.chunks = append(store.chunks, c)
-			store.chunkByID[c.ID] = idx
-			store.docChunks[c.DocumentID] = append(store.docChunks[c.DocumentID], idx)
-		}
-	}
-
-	// Open files for appending.
-	df, err := os.OpenFile(docPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
-	if err != nil {
-		return nil, fmt.Errorf("open documents file: %w", err)
-	}
-	store.docFile = df
-
-	cf, err := os.OpenFile(chunkPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
-	if err != nil {
-		df.Close()
-		return nil, fmt.Errorf("open chunks file: %w", err)
-	}
-	store.chunkFile = cf
 
 	return store, nil
+}
+
+func (s *DocumentStore) loadLegacyState() error {
+	docPath := filepath.Join(s.dataDir, "documents.jsonl")
+	if data, info, err := readRegularFileWithInfo(docPath, maxStoreFileSize); err == nil {
+		if info.Mode().Perm()&0077 != 0 || !hasSingleLink(info) {
+			return fmt.Errorf("legacy documents file must be owner-only and have exactly one link")
+		}
+		for lineNum, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			if line == "" {
+				continue
+			}
+			var document Document
+			if err := decodeStrictJSONLine(line, &document); err != nil {
+				return fmt.Errorf("invalid legacy document record at line %d", lineNum+1)
+			}
+			s.documents = append(s.documents, document)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("load legacy documents: %w", err)
+	}
+
+	chunkPath := filepath.Join(s.dataDir, "chunks.jsonl")
+	if data, info, err := readRegularFileWithInfo(chunkPath, maxStoreFileSize); err == nil {
+		if info.Mode().Perm()&0077 != 0 || !hasSingleLink(info) {
+			return fmt.Errorf("legacy chunks file must be owner-only and have exactly one link")
+		}
+		for lineNum, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			if line == "" {
+				continue
+			}
+			var chunk Chunk
+			if err := decodeStrictJSONLine(line, &chunk); err != nil {
+				return fmt.Errorf("invalid legacy chunk record at line %d", lineNum+1)
+			}
+			s.chunks = append(s.chunks, chunk)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("load legacy chunks: %w", err)
+	}
+	return nil
+}
+
+func (s *DocumentStore) rebuildIndexes() error {
+	s.docIndex = make(map[string]int, len(s.documents))
+	s.chunkByID = make(map[string]int, len(s.chunks))
+	s.docChunks = make(map[string][]int)
+	for index, document := range s.documents {
+		if document.ID == "" || len(document.ID) > 256 || strings.ContainsAny(document.ID, "\r\n\x00") ||
+			document.Name == "" || len(document.Name) > 1024 || document.ContentHash == "" ||
+			document.ChunkCount < 0 || !validSensitivities[document.SensitivityLabel] ||
+			!validTrustLevels[document.TrustLevel] || len(document.Source) > 256 ||
+			validateLabels(document.Labels) != nil {
+			return fmt.Errorf("invalid document record at index %d", index)
+		}
+		if _, err := time.Parse(time.RFC3339, document.IngestedAt); err != nil {
+			return fmt.Errorf("invalid document timestamp at index %d", index)
+		}
+		if _, err := hex.DecodeString(document.ContentHash); err != nil || len(document.ContentHash) != sha256.Size*2 {
+			return fmt.Errorf("invalid document content hash at index %d", index)
+		}
+		if _, duplicate := s.docIndex[document.ID]; duplicate {
+			return fmt.Errorf("duplicate document ID at index %d", index)
+		}
+		s.docIndex[document.ID] = index
+	}
+	for index, chunk := range s.chunks {
+		documentIndex, documentExists := s.docIndex[chunk.DocumentID]
+		if chunk.ID == "" || len(chunk.ID) > 512 || strings.ContainsAny(chunk.ID, "\r\n\x00") ||
+			chunk.DocumentID == "" || chunk.Index < 0 || len(chunk.Content) > maxRequestBodySize ||
+			chunk.ContentHash != hashContent(chunk.Content) || !validSensitivities[chunk.SensitivityLabel] ||
+			!validTrustLevels[chunk.TrustLevel] || validateLabels(chunk.Labels) != nil ||
+			math.IsNaN(chunk.Scan.RiskScore) || math.IsInf(chunk.Scan.RiskScore, 0) ||
+			chunk.Scan.RiskScore < 0 || chunk.Scan.RiskScore > 1 ||
+			len(chunk.Scan.PIITypes) > 128 || len(chunk.Scan.SuspiciousPatterns) > 1024 ||
+			len(chunk.Scan.RiskReasons) > 1024 {
+			return fmt.Errorf("invalid chunk record at index %d", index)
+		}
+		if chunk.ID != fmt.Sprintf("%s-c%d", chunk.DocumentID, chunk.Index) {
+			return fmt.Errorf("chunk ID does not match its document and index at position %d", index)
+		}
+		if _, duplicate := s.chunkByID[chunk.ID]; duplicate {
+			return fmt.Errorf("duplicate chunk ID at index %d", index)
+		}
+		if !documentExists {
+			return fmt.Errorf("chunk at index %d references an unknown document", index)
+		}
+		document := s.documents[documentIndex]
+		if chunk.SensitivityLabel != document.SensitivityLabel || chunk.TrustLevel != document.TrustLevel {
+			return fmt.Errorf("chunk at index %d does not inherit its document security labels", index)
+		}
+		s.chunkByID[chunk.ID] = index
+		s.docChunks[chunk.DocumentID] = append(s.docChunks[chunk.DocumentID], index)
+	}
+	for _, document := range s.documents {
+		if len(s.docChunks[document.ID]) != document.ChunkCount {
+			return fmt.Errorf("document %q chunk count does not match persisted chunks", document.ID)
+		}
+	}
+	if len(s.documents) > hardMaxDocuments || len(s.chunks) > hardMaxChunks {
+		return fmt.Errorf("persisted state exceeds hard record limits")
+	}
+	if s.retention.MaxDocuments > 0 && len(s.documents) > s.retention.MaxDocuments {
+		return fmt.Errorf("persisted document count exceeds retention limit")
+	}
+	if s.retention.MaxTotalChunks > 0 && len(s.chunks) > s.retention.MaxTotalChunks {
+		return fmt.Errorf("persisted chunk count exceeds retention limit")
+	}
+	return nil
 }
 
 // IngestRequest is the input for document ingestion.
@@ -240,6 +377,18 @@ type IngestRequest struct {
 // Ingest adds a document and its chunks to the store.
 // Enforces retention limits (max_documents, max_total_chunks).
 func (s *DocumentStore) Ingest(req IngestRequest, scanCfg ScannerConfig) (Document, []Chunk, error) {
+	return s.IngestWithAudit(req, scanCfg, nil)
+}
+
+// IngestWithAudit invokes authorize after the complete new record has been
+// prepared and scanned but before durable state is mutated.
+func (s *DocumentStore) IngestWithAudit(req IngestRequest, scanCfg ScannerConfig, authorize func(Document, []Chunk) error) (Document, []Chunk, error) {
+	if err := validateIngestRequest(req); err != nil {
+		return Document{}, nil, err
+	}
+	if err := validateChunkingCost(req.Content); err != nil {
+		return Document{}, nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -258,19 +407,26 @@ func (s *DocumentStore) Ingest(req IngestRequest, scanCfg ScannerConfig) (Docume
 		req.Source = "upload"
 	}
 
+	docID, err := generateID()
+	if err != nil {
+		return Document{}, nil, err
+	}
 	doc := Document{
-		ID:               generateID(),
+		ID:               docID,
 		Name:             req.Name,
 		Source:           req.Source,
 		SensitivityLabel: req.SensitivityLabel,
 		TrustLevel:       req.TrustLevel,
 		IngestedAt:       time.Now().UTC().Format(time.RFC3339),
-		Labels:           req.Labels,
+		Labels:           copyLabels(req.Labels),
 		ContentHash:      hashContent(req.Content),
 	}
 
 	// Chunk the content.
 	chunks := chunkDocument(doc, req.Content)
+	if len(chunks) > maxChunksPerDocument {
+		return Document{}, nil, fmt.Errorf("document exceeds %d chunks", maxChunksPerDocument)
+	}
 
 	// Enforce retention: max total chunks.
 	if s.retention.MaxTotalChunks > 0 && len(s.chunks)+len(chunks) > s.retention.MaxTotalChunks {
@@ -283,37 +439,44 @@ func (s *DocumentStore) Ingest(req IngestRequest, scanCfg ScannerConfig) (Docume
 	}
 
 	doc.ChunkCount = len(chunks)
-
-	// Persist document with fsync.
-	docData, _ := json.Marshal(doc)
-	if _, err := s.docFile.Write(append(docData, '\n')); err != nil {
-		return Document{}, nil, fmt.Errorf("write document: %w", err)
-	}
-	if err := s.docFile.Sync(); err != nil {
-		return Document{}, nil, fmt.Errorf("sync document file: %w", err)
-	}
-
-	docIdx := len(s.documents)
-	s.documents = append(s.documents, doc)
-	s.docIndex[doc.ID] = docIdx
-
-	// Persist chunks with fsync.
-	for _, c := range chunks {
-		chunkData, _ := json.Marshal(c)
-		if _, err := s.chunkFile.Write(append(chunkData, '\n')); err != nil {
-			return doc, nil, fmt.Errorf("write chunk: %w", err)
+	if authorize != nil {
+		if err := authorize(doc, chunks); err != nil {
+			return Document{}, nil, fmt.Errorf("audit ingest authorization: %w", err)
 		}
+	}
 
-		cIdx := len(s.chunks)
-		s.chunks = append(s.chunks, c)
+	newDocuments := append([]Document(nil), s.documents...)
+	newDocuments = append(newDocuments, doc)
+	newChunks := append([]Chunk(nil), s.chunks...)
+	newChunks = append(newChunks, chunks...)
+	if err := s.persistState(newDocuments, newChunks); err != nil {
+		return Document{}, nil, fmt.Errorf("persist document transaction: %w", err)
+	}
+
+	docIdx := len(newDocuments) - 1
+	s.documents = newDocuments
+	s.chunks = newChunks
+	s.docIndex[doc.ID] = docIdx
+	firstChunkIndex := len(newChunks) - len(chunks)
+	for offset, c := range chunks {
+		cIdx := firstChunkIndex + offset
 		s.chunkByID[c.ID] = cIdx
 		s.docChunks[doc.ID] = append(s.docChunks[doc.ID], cIdx)
 	}
-	if err := s.chunkFile.Sync(); err != nil {
-		return doc, chunks, fmt.Errorf("sync chunk file: %w", err)
-	}
 
-	return doc, chunks, nil
+	return cloneDocument(doc), cloneChunks(chunks), nil
+}
+
+func decodeStrictJSONLine(line string, dst any) error {
+	decoder := json.NewDecoder(strings.NewReader(line))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("trailing JSON data")
+	}
+	return nil
 }
 
 // GetDocument returns a document by ID.
@@ -324,7 +487,7 @@ func (s *DocumentStore) GetDocument(id string) (Document, bool) {
 	if !ok {
 		return Document{}, false
 	}
-	return s.documents[idx], true
+	return cloneDocument(s.documents[idx]), true
 }
 
 // GetChunk returns a chunk by ID.
@@ -335,7 +498,7 @@ func (s *DocumentStore) GetChunk(id string) (Chunk, bool) {
 	if !ok {
 		return Chunk{}, false
 	}
-	return s.chunks[idx], true
+	return cloneChunk(s.chunks[idx]), true
 }
 
 // ChunkFilter specifies query criteria for chunks.
@@ -351,30 +514,32 @@ func (s *DocumentStore) QueryChunks(filter ChunkFilter) []Chunk {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var candidates []Chunk
+	var results []Chunk
+	appendMatch := func(c Chunk) bool {
+		if filter.SensitivityLabel != "" && c.SensitivityLabel != filter.SensitivityLabel {
+			return false
+		}
+		if filter.TrustLevel != "" && c.TrustLevel != filter.TrustLevel {
+			return false
+		}
+		results = append(results, cloneChunk(c))
+		return filter.Limit > 0 && len(results) >= filter.Limit
+	}
 	if filter.DocumentID != "" {
 		indices, ok := s.docChunks[filter.DocumentID]
 		if !ok {
 			return nil
 		}
 		for _, idx := range indices {
-			candidates = append(candidates, s.chunks[idx])
+			if appendMatch(s.chunks[idx]) {
+				break
+			}
 		}
 	} else {
-		candidates = s.chunks
-	}
-
-	var results []Chunk
-	for _, c := range candidates {
-		if filter.SensitivityLabel != "" && c.SensitivityLabel != filter.SensitivityLabel {
-			continue
-		}
-		if filter.TrustLevel != "" && c.TrustLevel != filter.TrustLevel {
-			continue
-		}
-		results = append(results, c)
-		if filter.Limit > 0 && len(results) >= filter.Limit {
-			break
+		for i := range s.chunks {
+			if appendMatch(s.chunks[i]) {
+				break
+			}
 		}
 	}
 	return results
@@ -386,7 +551,9 @@ func (s *DocumentStore) ListDocuments() []Document {
 	defer s.mu.RUnlock()
 
 	result := make([]Document, len(s.documents))
-	copy(result, s.documents)
+	for i := range s.documents {
+		result[i] = cloneDocument(s.documents[i])
+	}
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].IngestedAt > result[j].IngestedAt
 	})
@@ -398,7 +565,9 @@ func (s *DocumentStore) AllChunks() []Chunk {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := make([]Chunk, len(s.chunks))
-	copy(result, s.chunks)
+	for i := range s.chunks {
+		result[i] = cloneChunk(s.chunks[i])
+	}
 	return result
 }
 
@@ -422,11 +591,23 @@ func (s *DocumentStore) ChunkCount() int {
 
 // DeleteDocument removes a document and its chunks, rewriting JSONL files.
 func (s *DocumentStore) DeleteDocument(docID string) error {
+	return s.DeleteDocumentWithAudit(docID, nil)
+}
+
+// DeleteDocumentWithAudit invokes authorize before the persisted state is
+// changed, ensuring an audit failure cannot produce an unaudited mutation.
+func (s *DocumentStore) DeleteDocumentWithAudit(docID string, authorize func(Document) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, ok := s.docIndex[docID]; !ok {
-		return fmt.Errorf("document not found: %s", docID)
+	documentIndex, ok := s.docIndex[docID]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrDocumentNotFound, docID)
+	}
+	if authorize != nil {
+		if err := authorize(cloneDocument(s.documents[documentIndex])); err != nil {
+			return fmt.Errorf("audit delete authorization: %w", err)
+		}
 	}
 
 	// Rebuild arrays excluding the deleted document and its chunks.
@@ -459,25 +640,26 @@ func (s *DocumentStore) DeleteDocument(docID string) error {
 		newDocChunks[c.DocumentID] = append(newDocChunks[c.DocumentID], idx)
 	}
 
+	if err := s.persistState(newDocs, newChunks); err != nil {
+		return fmt.Errorf("persist delete transaction: %w", err)
+	}
 	s.documents = newDocs
 	s.docIndex = newDocIndex
 	s.chunks = newChunks
 	s.chunkByID = newChunkByID
 	s.docChunks = newDocChunks
-
-	// Rewrite JSONL files.
-	if err := s.rewriteDocFile(); err != nil {
-		return fmt.Errorf("rewrite documents: %w", err)
-	}
-	if err := s.rewriteChunkFile(); err != nil {
-		return fmt.Errorf("rewrite chunks: %w", err)
-	}
 	return nil
 }
 
 // PurgeExpired removes documents older than the retention TTL.
 // Returns the number of documents purged.
 func (s *DocumentStore) PurgeExpired() (int, error) {
+	return s.PurgeExpiredWithAudit(nil)
+}
+
+// PurgeExpiredWithAudit authorizes the complete deletion set before committing
+// one replacement snapshot.
+func (s *DocumentStore) PurgeExpiredWithAudit(authorize func([]Document) error) (int, error) {
 	if s.retention.TTLDays <= 0 {
 		return 0, nil
 	}
@@ -485,16 +667,29 @@ func (s *DocumentStore) PurgeExpired() (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cutoff := time.Now().UTC().AddDate(0, 0, -s.retention.TTLDays).Format(time.RFC3339)
+	cutoff := time.Now().UTC().AddDate(0, 0, -s.retention.TTLDays)
 	var expiredIDs []string
 	for _, d := range s.documents {
-		if d.IngestedAt < cutoff {
+		ingestedAt, err := time.Parse(time.RFC3339, d.IngestedAt)
+		if err != nil {
+			return 0, fmt.Errorf("invalid stored ingestion timestamp for %q", d.ID)
+		}
+		if ingestedAt.Before(cutoff) {
 			expiredIDs = append(expiredIDs, d.ID)
 		}
 	}
 
 	if len(expiredIDs) == 0 {
 		return 0, nil
+	}
+	if authorize != nil {
+		expiredDocuments := make([]Document, 0, len(expiredIDs))
+		for _, id := range expiredIDs {
+			expiredDocuments = append(expiredDocuments, cloneDocument(s.documents[s.docIndex[id]]))
+		}
+		if err := authorize(expiredDocuments); err != nil {
+			return 0, fmt.Errorf("audit retention purge authorization: %w", err)
+		}
 	}
 
 	// Build set of deleted doc IDs and chunk indices.
@@ -532,90 +727,152 @@ func (s *DocumentStore) PurgeExpired() (int, error) {
 		newDocChunks[c.DocumentID] = append(newDocChunks[c.DocumentID], idx)
 	}
 
+	if err := s.persistState(newDocs, newChunks); err != nil {
+		return 0, fmt.Errorf("persist purge transaction: %w", err)
+	}
 	s.documents = newDocs
 	s.docIndex = newDocIndex
 	s.chunks = newChunks
 	s.chunkByID = newChunkByID
 	s.docChunks = newDocChunks
 
-	// Rewrite JSONL files.
-	if err := s.rewriteDocFile(); err != nil {
-		return 0, fmt.Errorf("rewrite documents: %w", err)
-	}
-	if err := s.rewriteChunkFile(); err != nil {
-		return 0, fmt.Errorf("rewrite chunks: %w", err)
-	}
-
 	return len(expiredIDs), nil
 }
 
-// rewriteDocFile rewrites the documents JSONL from in-memory state.
-func (s *DocumentStore) rewriteDocFile() error {
-	if s.docFile != nil {
-		s.docFile.Close()
-	}
-
-	path := s.dataDir + "/documents.jsonl"
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0640)
+func (s *DocumentStore) persistState(documents []Document, chunks []Chunk) error {
+	currentInfo, err := s.validateCurrentStatePath()
 	if err != nil {
 		return err
 	}
-	for _, d := range s.documents {
-		data, _ := json.Marshal(d)
-		f.Write(append(data, '\n'))
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	f.Close()
 
-	// Reopen for appending.
-	f, err = os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
+	tmp, err := os.CreateTemp(s.dataDir, ".store-*.json")
 	if err != nil {
 		return err
 	}
-	s.docFile = f
+	tmpPath := tmp.Name()
+	ok := false
+	defer func() {
+		_ = tmp.Close()
+		if !ok {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0600); err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(tmp)
+	if err := encoder.Encode(persistedState{Version: 1, Documents: documents, Chunks: chunks}); err != nil {
+		return err
+	}
+	info, err := tmp.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() > maxStoreFileSize {
+		return fmt.Errorf("state exceeds %d-byte limit", maxStoreFileSize)
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := s.requireUnchangedStatePath(currentInfo); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, s.statePath); err != nil {
+		return err
+	}
+	dir, err := os.Open(s.dataDir)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return err
+	}
+	newInfo, err := os.Lstat(s.statePath)
+	if err != nil || !newInfo.Mode().IsRegular() || newInfo.Mode().Perm()&0077 != 0 || !hasSingleLink(newInfo) {
+		return fmt.Errorf("persisted state file failed post-write validation")
+	}
+	s.stateInfo = newInfo
+	ok = true
 	return nil
 }
 
-// rewriteChunkFile rewrites the chunks JSONL from in-memory state.
-func (s *DocumentStore) rewriteChunkFile() error {
-	if s.chunkFile != nil {
-		s.chunkFile.Close()
+func (s *DocumentStore) validateCurrentStatePath() (os.FileInfo, error) {
+	info, err := os.Lstat(s.statePath)
+	if os.IsNotExist(err) {
+		if s.stateInfo != nil {
+			return nil, fmt.Errorf("state file was removed outside this process")
+		}
+		return nil, nil
 	}
-
-	path := s.dataDir + "/chunks.jsonl"
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0640)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	for _, c := range s.chunks {
-		data, _ := json.Marshal(c)
-		f.Write(append(data, '\n'))
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || !hasSingleLink(info) {
+		return nil, fmt.Errorf("state file must remain owner-only, regular, and singly linked")
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
+	if s.stateInfo == nil {
+		return nil, fmt.Errorf("state file appeared outside this process")
 	}
-	f.Close()
+	if !os.SameFile(info, s.stateInfo) || info.Size() != s.stateInfo.Size() || !info.ModTime().Equal(s.stateInfo.ModTime()) {
+		return nil, fmt.Errorf("state file changed outside this process")
+	}
+	return info, nil
+}
 
-	// Reopen for appending.
-	f, err = os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0640)
-	if err != nil {
-		return err
+func (s *DocumentStore) requireUnchangedStatePath(expected os.FileInfo) error {
+	info, err := os.Lstat(s.statePath)
+	if expected == nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("state file appeared during persistence")
 	}
-	s.chunkFile = f
+	if err != nil || !os.SameFile(info, expected) || info.Size() != expected.Size() ||
+		!info.ModTime().Equal(expected.ModTime()) {
+		return fmt.Errorf("state file changed during persistence")
+	}
 	return nil
 }
 
-// Close closes the store files.
-func (s *DocumentStore) Close() error {
-	if s.docFile != nil {
-		s.docFile.Close()
+// Close is retained for API compatibility; snapshots do not keep files open.
+func (s *DocumentStore) Close() error { return nil }
+
+func validateLabels(labels map[string]string) error {
+	if len(labels) > 64 {
+		return fmt.Errorf("too many labels")
 	}
-	if s.chunkFile != nil {
-		s.chunkFile.Close()
+	for key, value := range labels {
+		if key == "" || len(key) > 128 || len(value) > 1024 || strings.ContainsAny(key, "\r\n\x00") || strings.ContainsAny(value, "\r\n\x00") {
+			return fmt.Errorf("invalid label")
+		}
 	}
 	return nil
+}
+
+func cloneDocument(document Document) Document {
+	document.Labels = copyLabels(document.Labels)
+	return document
+}
+
+func cloneChunk(chunk Chunk) Chunk {
+	chunk.Labels = copyLabels(chunk.Labels)
+	chunk.Scan.PIITypes = append([]string(nil), chunk.Scan.PIITypes...)
+	chunk.Scan.SuspiciousPatterns = append([]string(nil), chunk.Scan.SuspiciousPatterns...)
+	chunk.Scan.RiskReasons = append([]RiskReason(nil), chunk.Scan.RiskReasons...)
+	return chunk
+}
+
+func cloneChunks(chunks []Chunk) []Chunk {
+	result := make([]Chunk, len(chunks))
+	for i := range chunks {
+		result[i] = cloneChunk(chunks[i])
+	}
+	return result
 }

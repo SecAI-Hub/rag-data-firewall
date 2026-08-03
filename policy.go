@@ -16,8 +16,8 @@ type RetrievalRequest struct {
 	RequesterType string   `json:"requester_type,omitempty"` // user, tool, system
 	Model         string   `json:"model,omitempty"`
 	MaxChunks     int      `json:"max_chunks,omitempty"`
-	ChunkIDs      []string `json:"chunk_ids,omitempty"`      // evaluate specific chunks
-	DocumentIDs   []string `json:"document_ids,omitempty"`   // filter by document
+	ChunkIDs      []string `json:"chunk_ids,omitempty"`    // evaluate specific chunks
+	DocumentIDs   []string `json:"document_ids,omitempty"` // filter by document
 }
 
 // ChunkDecision records the policy verdict for a single chunk.
@@ -181,16 +181,25 @@ func (e *PolicyEngine) Evaluate(chunks []Chunk, docSourceMap map[string]string, 
 		}
 	}
 
+	if req.MaxChunks > 0 {
+		remaining := req.MaxChunks
+		if len(resp.Allowed) > remaining {
+			resp.Allowed = resp.Allowed[:remaining]
+			remaining = 0
+		} else {
+			remaining -= len(resp.Allowed)
+		}
+		if len(resp.Redacted) > remaining {
+			resp.Redacted = resp.Redacted[:remaining]
+		}
+	}
+
 	resp.Summary = DecisionSummary{
 		TotalChunks:     len(chunks),
 		Allowed:         len(resp.Allowed),
 		Denied:          len(resp.Denied),
 		Redacted:        len(resp.Redacted),
 		PendingApproval: len(resp.PendingApproval),
-	}
-
-	if req.MaxChunks > 0 && len(resp.Allowed) > req.MaxChunks {
-		resp.Allowed = resp.Allowed[:req.MaxChunks]
 	}
 
 	return resp

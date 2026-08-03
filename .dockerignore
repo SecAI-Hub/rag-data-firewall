@@ -1,0 +1,9 @@
+.git
+.github
+*.md
+SECURITY_AUDIT.md
+rag-data-firewall
+coverage.out
+dist
+data
+run
