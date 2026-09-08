@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -58,13 +57,13 @@ type RateLimitCfg struct {
 // ---------------------------------------------------------------------------
 
 var (
-	policyMu sync.RWMutex
-	policy   FirewallPolicy
-	engine   *PolicyEngine
+	policyMu      sync.RWMutex
+	activeRuntime *policyRuntime
 
 	docStore *DocumentStore
 
 	auditFile     *os.File
+	auditWriter   *writerLock
 	auditMu       sync.Mutex
 	auditPath     string
 	auditLastHash string
@@ -135,11 +134,15 @@ func readPolicy() (FirewallPolicy, error) {
 	return p, nil
 }
 
-func installPolicy(p FirewallPolicy) {
+func installPolicy(p FirewallPolicy) error {
+	next, err := newPolicyRuntime(p)
+	if err != nil {
+		return err
+	}
 	policyMu.Lock()
-	policy = p
-	engine = NewPolicyEngine(p.DefaultAction, p.Rules)
+	activeRuntime = next
 	policyMu.Unlock()
+	return nil
 }
 
 func loadPolicy() error {
@@ -147,24 +150,22 @@ func loadPolicy() error {
 	if err != nil {
 		return err
 	}
-	installPolicy(p)
+	if err := installPolicy(p); err != nil {
+		return err
+	}
 
 	log.Printf("policy loaded: default=%s rules=%d", p.DefaultAction, len(p.Rules))
 	return nil
 }
 
-func getPolicy() FirewallPolicy {
-	policyMu.RLock()
-	p := policy
-	policyMu.RUnlock()
-	return p
-}
+func getPolicy() FirewallPolicy { return getRuntime().copyPolicy() }
 
 func getEngine() *PolicyEngine {
-	policyMu.RLock()
-	e := engine
-	policyMu.RUnlock()
-	return e
+	snapshot := getRuntime()
+	if snapshot == nil {
+		return nil
+	}
+	return snapshot.engine
 }
 
 func getDataDir() string {
@@ -180,16 +181,24 @@ func getDataDir() string {
 // ---------------------------------------------------------------------------
 
 type AuditEntry struct {
-	Timestamp string `json:"timestamp"`
-	Action    string `json:"action"`
-	Allowed   int    `json:"allowed,omitempty"`
-	Denied    int    `json:"denied,omitempty"`
-	Detail    string `json:"detail,omitempty"`
-	Hash      string `json:"hash"`
-	PrevHash  string `json:"prev_hash,omitempty"`
+	Timestamp    string               `json:"timestamp"`
+	Action       string               `json:"action"`
+	Allowed      int                  `json:"allowed,omitempty"`
+	Denied       int                  `json:"denied,omitempty"`
+	Detail       string               `json:"detail,omitempty"`
+	Hash         string               `json:"hash"`
+	PrevHash     string               `json:"prev_hash,omitempty"`
+	PolicyDigest string               `json:"policy_digest,omitempty"`
+	Decisions    []AuditChunkDecision `json:"decisions,omitempty"`
+	Identity     string               `json:"identity,omitempty"`
 }
 
 func initAuditLog() error {
+	auditMu.Lock()
+	defer auditMu.Unlock()
+	if auditFile != nil || auditWriter != nil {
+		return fmt.Errorf("audit log is already initialized")
+	}
 	auditPath = os.Getenv("AUDIT_LOG_PATH")
 	if auditPath == "" {
 		auditPath = defaultAuditPath
@@ -201,6 +210,17 @@ func initAuditLog() error {
 		return fmt.Errorf("secure audit directory: %w", err)
 	}
 
+	writer, err := acquireWriterLock(auditPath + ".lock")
+	if err != nil {
+		return fmt.Errorf("lock audit: %w", err)
+	}
+	opened := false
+	defer func() {
+		if !opened {
+			_ = writer.Close()
+		}
+	}()
+
 	verifiedInfo, err := verifyExistingAuditLog(auditPath)
 	if err != nil {
 		return err
@@ -208,7 +228,7 @@ func initAuditLog() error {
 
 	// #nosec G304 -- auditPath is operator configuration inside a verified
 	// private directory; Lstat/Fstat/link/identity checks immediately follow.
-	f, err := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0600)
 	if err != nil {
 		return fmt.Errorf("open audit log: %w", err)
 	}
@@ -234,6 +254,16 @@ func initAuditLog() error {
 		_ = f.Close()
 		return fmt.Errorf("audit log changed after verification")
 	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := syncPrivateDirectory(filepath.Dir(auditPath)); err != nil {
+		_ = f.Close()
+		return err
+	}
+	auditWriter = writer
+	opened = true
 	auditFile = f
 	auditFileSize = openedInfo.Size()
 	auditFileTime = openedInfo.ModTime()
@@ -243,19 +273,25 @@ func initAuditLog() error {
 // computeAuditHash returns a SHA-256 digest over all fields except Hash.
 func computeAuditHash(entry AuditEntry) string {
 	canonical := struct {
-		Timestamp string `json:"timestamp"`
-		Action    string `json:"action"`
-		Allowed   int    `json:"allowed,omitempty"`
-		Denied    int    `json:"denied,omitempty"`
-		Detail    string `json:"detail,omitempty"`
-		PrevHash  string `json:"prev_hash,omitempty"`
+		Timestamp    string               `json:"timestamp"`
+		Action       string               `json:"action"`
+		Allowed      int                  `json:"allowed,omitempty"`
+		Denied       int                  `json:"denied,omitempty"`
+		Detail       string               `json:"detail,omitempty"`
+		PrevHash     string               `json:"prev_hash,omitempty"`
+		PolicyDigest string               `json:"policy_digest,omitempty"`
+		Decisions    []AuditChunkDecision `json:"decisions,omitempty"`
+		Identity     string               `json:"identity,omitempty"`
 	}{
-		Timestamp: entry.Timestamp,
-		Action:    entry.Action,
-		Allowed:   entry.Allowed,
-		Denied:    entry.Denied,
-		Detail:    entry.Detail,
-		PrevHash:  entry.PrevHash,
+		Timestamp:    entry.Timestamp,
+		Action:       entry.Action,
+		Allowed:      entry.Allowed,
+		Denied:       entry.Denied,
+		Detail:       entry.Detail,
+		PrevHash:     entry.PrevHash,
+		PolicyDigest: entry.PolicyDigest,
+		Decisions:    entry.Decisions,
+		Identity:     entry.Identity,
 	}
 	data, _ := json.Marshal(canonical)
 	h := sha256.Sum256(data)
@@ -265,19 +301,8 @@ func computeAuditHash(entry AuditEntry) string {
 func writeAudit(entry AuditEntry) error {
 	auditMu.Lock()
 	defer auditMu.Unlock()
-	if auditFile == nil {
-		return fmt.Errorf("audit log is unavailable")
-	}
-	pathInfo, err := os.Lstat(auditPath)
-	if err != nil {
-		return disableAudit(fmt.Errorf("inspect audit log before append: %w", err))
-	}
-	openedInfo, err := auditFile.Stat()
-	if err != nil || !pathInfo.Mode().IsRegular() || pathInfo.Mode().Perm()&0077 != 0 ||
-		!hasSingleLink(pathInfo) || !hasSingleLink(openedInfo) || !os.SameFile(pathInfo, openedInfo) ||
-		openedInfo.Size() != auditFileSize || pathInfo.Size() != auditFileSize ||
-		!openedInfo.ModTime().Equal(auditFileTime) || !pathInfo.ModTime().Equal(auditFileTime) {
-		return disableAudit(fmt.Errorf("audit log changed outside this process"))
+	if err := validateLiveAuditLocked(); err != nil {
+		return disableAudit(err)
 	}
 	entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	entry.PrevHash = auditLastHash
@@ -286,6 +311,9 @@ func writeAudit(entry AuditEntry) error {
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return err
+	}
+	if len(data)+1 > maxAuditLineSize {
+		return fmt.Errorf("audit record exceeds replay limit")
 	}
 	if auditFileSize+int64(len(data))+1 > maxAuditSize {
 		return disableAudit(fmt.Errorf("audit log reached its configured size limit"))
@@ -321,10 +349,46 @@ func disableAudit(cause error) error {
 	return cause
 }
 
+func validateLiveAuditLocked() error {
+	if err := auditWriter.Validate(); err != nil {
+		return err
+	}
+	if auditFile == nil {
+		return fmt.Errorf("audit log is unavailable")
+	}
+	pathInfo, err := os.Lstat(auditPath)
+	if err != nil {
+		return fmt.Errorf("inspect audit log before append: %w", err)
+	}
+	openedInfo, err := auditFile.Stat()
+	if err != nil || !pathInfo.Mode().IsRegular() || pathInfo.Mode().Perm()&0077 != 0 ||
+		!hasSingleLink(pathInfo) || !hasSingleLink(openedInfo) || !os.SameFile(pathInfo, openedInfo) ||
+		openedInfo.Size() != auditFileSize || pathInfo.Size() != auditFileSize ||
+		!openedInfo.ModTime().Equal(auditFileTime) || !pathInfo.ModTime().Equal(auditFileTime) {
+		return fmt.Errorf("audit log changed outside this process")
+	}
+	return nil
+}
+
 func auditIsReady() bool {
 	auditMu.Lock()
 	defer auditMu.Unlock()
-	return auditFile != nil
+	if err := validateLiveAuditLocked(); err != nil {
+		_ = disableAudit(err)
+		return false
+	}
+	return true
+}
+
+func closeAuditLog() {
+	auditMu.Lock()
+	defer auditMu.Unlock()
+	if auditFile != nil {
+		_ = auditFile.Close()
+		auditFile = nil
+	}
+	_ = auditWriter.Close()
+	auditWriter = nil
 }
 
 func verifyExistingAuditLog(path string) (os.FileInfo, error) {
@@ -341,7 +405,7 @@ func verifyExistingAuditLog(path string) (os.FileInfo, error) {
 	}
 	// #nosec G304 -- path is the configured audit log; the bounded chain reader
 	// pins it with Lstat/Fstat and verifies identity again after the full read.
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("read audit log: %w", err)
 	}
@@ -349,6 +413,12 @@ func verifyExistingAuditLog(path string) (os.FileInfo, error) {
 	openedInfo, err := f.Stat()
 	if err != nil || !os.SameFile(info, openedInfo) || !hasSingleLink(openedInfo) {
 		return nil, fmt.Errorf("audit log changed while opening")
+	}
+	if openedInfo.Size() > 0 {
+		var last [1]byte
+		if _, err := f.ReadAt(last[:], openedInfo.Size()-1); err != nil || last[0] != '\n' {
+			return nil, fmt.Errorf("audit log has an incomplete final record")
+		}
 	}
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), maxAuditLineSize)
@@ -394,20 +464,9 @@ func loadServiceToken() error {
 	if tokenPath == "" {
 		tokenPath = defaultTokenPath
 	}
-	info, err := os.Lstat(tokenPath)
+	token, err := readRoleToken(tokenPath)
 	if err != nil {
 		return fmt.Errorf("load service token: %w", err)
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-		return fmt.Errorf("service token must be an owner-only regular file")
-	}
-	data, err := readRegularFile(tokenPath, maxServiceTokenSize)
-	if err != nil {
-		return fmt.Errorf("load service token: %w", err)
-	}
-	token := strings.TrimSpace(string(data))
-	if !validServiceToken(token) {
-		return fmt.Errorf("service token must be at least 32 bytes without whitespace or control characters")
 	}
 	serviceToken = token
 	log.Printf("service token loaded")
@@ -455,7 +514,8 @@ func requireServiceToken(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		token := strings.TrimPrefix(auth, "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(token), []byte(serviceToken)) != 1 {
+		actor, valid := authenticateToken(token)
+		if !valid {
 			jsonError(w, "forbidden: invalid service token", http.StatusForbidden)
 			return
 		}
@@ -470,7 +530,11 @@ func requireServiceToken(next http.HandlerFunc) http.HandlerFunc {
 			jsonError(w, "too many concurrent requests", http.StatusTooManyRequests)
 			return
 		}
-		next(w, r)
+		if docStore == nil || docStore.Ready() != nil || !auditIsReady() {
+			jsonError(w, "service persistence unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		next(w, withPrincipal(r, actor))
 	}
 }
 
@@ -532,7 +596,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if docStore == nil || getEngine() == nil || serviceToken == "" || !auditIsReady() {
+	if docStore == nil || docStore.Ready() != nil || getEngine() == nil || serviceToken == "" || !auditIsReady() {
 		jsonError(w, "service not ready", http.StatusServiceUnavailable)
 		return
 	}
@@ -542,6 +606,9 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleIngest(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, roleIngester, roleCurator, roleAdmin) {
+		return
+	}
 	totalRequests.Add(1)
 	ingestRequests.Add(1)
 
@@ -559,9 +626,18 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := bindIngestProvenance(r, &req); err != nil {
+		jsonError(w, err.Error(), http.StatusForbidden)
+		return
+	}
 
-	pol := getPolicy()
-	doc, chunks, err := docStore.IngestWithAudit(req, pol.Scanner, func(doc Document, chunks []Chunk) error {
+	snapshot := getRuntime()
+	if snapshot == nil {
+		jsonError(w, "policy unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	pol := snapshot.policy
+	doc, chunks, err := docStore.ingestWithScanner(req, pol.Scanner, snapshot.scan, func(doc Document, chunks []Chunk) error {
 		flagged := 0
 		for _, chunk := range chunks {
 			if chunk.Scan.PromptInjection || chunk.Scan.RiskScore >= pol.Scanner.MinRiskToFlag {
@@ -569,8 +645,10 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		return writeAudit(AuditEntry{
-			Action: "ingest_authorized",
-			Detail: fmt.Sprintf("doc=%s chunks=%d flagged=%d", doc.ID, len(chunks), flagged),
+			Action:       "ingest_authorized",
+			Identity:     requestPrincipal(r).identity,
+			PolicyDigest: snapshot.digest,
+			Detail:       fmt.Sprintf("doc=%s chunks=%d flagged=%d", doc.ID, len(chunks), flagged),
 		})
 	})
 	if err != nil {
@@ -594,13 +672,17 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"document": doc,
-		"chunks":   len(chunks),
-		"flagged":  flagged,
+		"document":      doc,
+		"policy_digest": snapshot.digest,
+		"chunks":        len(chunks),
+		"flagged":       flagged,
 	})
 }
 
 func handleRetrieve(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, roleReader, roleCurator, roleAdmin) {
+		return
+	}
 	totalRequests.Add(1)
 	retrieveRequests.Add(1)
 
@@ -626,6 +708,11 @@ func handleRetrieve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	snapshot := getRuntime()
+	if snapshot == nil {
+		jsonError(w, "policy unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	// Gather candidate chunks with tightened scoping.
 	const maxCandidates = 1000
 	var candidates []Chunk
@@ -681,9 +768,8 @@ func handleRetrieve(w http.ResponseWriter, r *http.Request) {
 	// Treat stored scan results as evidence, not authority. Re-scan content at
 	// retrieval time so policy reloads and local state tampering cannot preserve
 	// a stale fail-open verdict.
-	pol := getPolicy()
 	for i := range candidates {
-		candidates[i].Scan = ScanContent(candidates[i].Content, pol.Scanner)
+		candidates[i].Scan = snapshot.scan(candidates[i].Content, snapshot.policy.Scanner)
 	}
 
 	// Build doc source lookup.
@@ -696,14 +782,21 @@ func handleRetrieve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	eng := getEngine()
-	resp := eng.Evaluate(candidates, docSourceMap, req)
+	if err := docStore.Ready(); err != nil {
+		jsonError(w, "corpus persistence unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	resp := snapshot.engine.Evaluate(candidates, docSourceMap, req)
+	resp.PolicyDigest = snapshot.digest
 
 	if err := writeAudit(AuditEntry{
-		Action:  "retrieve",
-		Allowed: resp.Summary.Allowed,
-		Denied:  resp.Summary.Denied,
-		Detail:  fmt.Sprintf("requester=%s tool=%s chunks=%d", req.RequesterType, req.Tool, resp.Summary.TotalChunks),
+		Action:       "retrieve",
+		Identity:     requestPrincipal(r).identity,
+		PolicyDigest: snapshot.digest,
+		Decisions:    decisionEvidence(candidates, resp),
+		Allowed:      resp.Summary.Allowed,
+		Denied:       resp.Summary.Denied,
+		Detail:       fmt.Sprintf("requester=%s chunks=%d", req.RequesterType, resp.Summary.TotalChunks),
 	}); err != nil {
 		log.Printf("audit write failed: %v", err)
 		jsonError(w, "audit persistence failed", http.StatusServiceUnavailable)
@@ -715,6 +808,9 @@ func handleRetrieve(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleScan(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, roleReader, roleIngester, roleCurator, roleAdmin) {
+		return
+	}
 	totalRequests.Add(1)
 
 	if r.Method != http.MethodPost {
@@ -734,13 +830,22 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := ScanContent(req.Content, getPolicy().Scanner)
+	snapshot := getRuntime()
+	if snapshot == nil {
+		jsonError(w, "policy unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	result := snapshot.scan(req.Content, snapshot.policy.Scanner)
+	w.Header().Set("X-SecAI-Policy-Digest", snapshot.digest)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
 }
 
 func handleDocuments(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, roleCurator, roleAdmin) {
+		return
+	}
 	totalRequests.Add(1)
 
 	switch r.Method {
@@ -758,8 +863,9 @@ func handleDocuments(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := docStore.DeleteDocumentWithAudit(id, func(document Document) error {
 			return writeAudit(AuditEntry{
-				Action: "delete_authorized",
-				Detail: fmt.Sprintf("doc=%s", document.ID),
+				Action:   "delete_authorized",
+				Identity: requestPrincipal(r).identity,
+				Detail:   fmt.Sprintf("doc=%s", document.ID),
 			})
 		}); err != nil {
 			if !auditIsReady() {
@@ -783,6 +889,9 @@ func handleDocuments(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleListChunks(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, roleCurator, roleAdmin) {
+		return
+	}
 	totalRequests.Add(1)
 
 	if r.Method != http.MethodGet {
@@ -837,6 +946,9 @@ func handleListChunks(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleReload(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, roleAdmin) {
+		return
+	}
 	totalRequests.Add(1)
 
 	if r.Method != http.MethodPost {
@@ -849,23 +961,36 @@ func handleReload(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "policy reload failed", http.StatusInternalServerError)
 		return
 	}
-	currentPolicy := getPolicy()
-	if nextPolicy.DataDir != currentPolicy.DataDir || nextPolicy.Retention != currentPolicy.Retention ||
-		nextPolicy.Daemon != currentPolicy.Daemon {
+	next, err := newPolicyRuntime(nextPolicy)
+	if err != nil {
+		jsonError(w, "invalid policy", http.StatusBadRequest)
+		return
+	}
+	// Serialize validation against the live generation, audit and publication.
+	policyMu.Lock()
+	defer policyMu.Unlock()
+	if activeRuntime == nil {
+		jsonError(w, "policy unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	currentPolicy := activeRuntime.policy
+	if nextPolicy.DataDir != currentPolicy.DataDir || nextPolicy.Retention != currentPolicy.Retention || nextPolicy.Daemon != currentPolicy.Daemon {
 		jsonError(w, "data, retention, and daemon settings require a restart", http.StatusConflict)
 		return
 	}
-	if err := writeAudit(AuditEntry{Action: "policy_reload_authorized", Detail: "validated strict policy reload"}); err != nil {
-		log.Printf("audit write failed: %v", err)
+	if err := writeAudit(AuditEntry{Action: "policy_reload_authorized", Identity: requestPrincipal(r).identity, PolicyDigest: next.digest, Detail: "previous=" + activeRuntime.digest}); err != nil {
 		jsonError(w, "audit persistence failed", http.StatusServiceUnavailable)
 		return
 	}
-	installPolicy(nextPolicy)
+	activeRuntime = next
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "policy reloaded"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "policy reloaded", "policy_digest": next.digest})
 }
 
 func handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, roleAdmin) {
+		return
+	}
 	if r.Method != http.MethodGet {
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -905,18 +1030,16 @@ func runDaemon(bindAddr string) error {
 	if err := loadServiceToken(); err != nil {
 		return err
 	}
+	if err := loadRoleTokens(); err != nil {
+		return err
+	}
 	if err := loadServiceIdentity(); err != nil {
 		return err
 	}
 	if err := initAuditLog(); err != nil {
 		return err
 	}
-	defer func() {
-		if auditFile != nil {
-			auditFile.Close()
-			auditFile = nil
-		}
-	}()
+	defer closeAuditLog()
 	purgeExpired := func() error {
 		count, err := docStore.PurgeExpiredWithAudit(func(documents []Document) error {
 			return writeAudit(AuditEntry{

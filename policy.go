@@ -32,6 +32,7 @@ type ChunkDecision struct {
 
 // RetrievalResponse is the full policy evaluation result.
 type RetrievalResponse struct {
+	PolicyDigest    string          `json:"policy_digest,omitempty"`
 	Allowed         []ChunkDecision `json:"allowed"`
 	Denied          []ChunkDecision `json:"denied"`
 	Redacted        []ChunkDecision `json:"redacted,omitempty"`

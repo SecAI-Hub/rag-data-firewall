@@ -190,6 +190,7 @@ type DocumentStore struct {
 	statePath string
 	stateInfo os.FileInfo
 	retention RetentionConfig
+	writer    *writerLock
 }
 
 type persistedState struct {
@@ -206,6 +207,16 @@ func NewDocumentStore(dataDir string, retention RetentionConfig) (*DocumentStore
 	if err := ensurePrivateDirectory(dataDir); err != nil {
 		return nil, fmt.Errorf("secure data directory: %w", err)
 	}
+	writer, err := acquireWriterLock(filepath.Join(dataDir, ".writer.lock"))
+	if err != nil {
+		return nil, fmt.Errorf("lock corpus: %w", err)
+	}
+	opened := false
+	defer func() {
+		if !opened {
+			_ = writer.Close()
+		}
+	}()
 
 	store := &DocumentStore{
 		docIndex:  make(map[string]int),
@@ -214,6 +225,7 @@ func NewDocumentStore(dataDir string, retention RetentionConfig) (*DocumentStore
 		dataDir:   dataDir,
 		statePath: filepath.Join(dataDir, "store.json"),
 		retention: retention,
+		writer:    writer,
 	}
 
 	data, stateInfo, err := readRegularFileWithInfo(store.statePath, maxStoreFileSize)
@@ -252,6 +264,7 @@ func NewDocumentStore(dataDir string, retention RetentionConfig) (*DocumentStore
 		}
 	}
 
+	opened = true
 	return store, nil
 }
 
@@ -383,6 +396,12 @@ func (s *DocumentStore) Ingest(req IngestRequest, scanCfg ScannerConfig) (Docume
 // IngestWithAudit invokes authorize after the complete new record has been
 // prepared and scanned but before durable state is mutated.
 func (s *DocumentStore) IngestWithAudit(req IngestRequest, scanCfg ScannerConfig, authorize func(Document, []Chunk) error) (Document, []Chunk, error) {
+	return s.ingestWithScanner(req, scanCfg, ScanContent, authorize)
+}
+
+// ingestWithScanner binds the scanner implementation to the same immutable
+// runtime generation that supplies the HTTP request's config and audit digest.
+func (s *DocumentStore) ingestWithScanner(req IngestRequest, scanCfg ScannerConfig, scan func(string, ScannerConfig) ScanResult, authorize func(Document, []Chunk) error) (Document, []Chunk, error) {
 	if err := validateIngestRequest(req); err != nil {
 		return Document{}, nil, err
 	}
@@ -391,6 +410,9 @@ func (s *DocumentStore) IngestWithAudit(req IngestRequest, scanCfg ScannerConfig
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, err := s.validateCurrentStatePath(); err != nil {
+		return Document{}, nil, err
+	}
 
 	// Enforce retention: max documents.
 	if s.retention.MaxDocuments > 0 && len(s.documents) >= s.retention.MaxDocuments {
@@ -435,7 +457,7 @@ func (s *DocumentStore) IngestWithAudit(req IngestRequest, scanCfg ScannerConfig
 
 	// Scan each chunk.
 	for i := range chunks {
-		chunks[i].Scan = ScanContent(chunks[i].Content, scanCfg)
+		chunks[i].Scan = scan(chunks[i].Content, scanCfg)
 	}
 
 	doc.ChunkCount = len(chunks)
@@ -483,6 +505,9 @@ func decodeStrictJSONLine(line string, dst any) error {
 func (s *DocumentStore) GetDocument(id string) (Document, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.writer == nil {
+		return Document{}, false
+	}
 	idx, ok := s.docIndex[id]
 	if !ok {
 		return Document{}, false
@@ -494,6 +519,9 @@ func (s *DocumentStore) GetDocument(id string) (Document, bool) {
 func (s *DocumentStore) GetChunk(id string) (Chunk, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.writer == nil {
+		return Chunk{}, false
+	}
 	idx, ok := s.chunkByID[id]
 	if !ok {
 		return Chunk{}, false
@@ -513,6 +541,9 @@ type ChunkFilter struct {
 func (s *DocumentStore) QueryChunks(filter ChunkFilter) []Chunk {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.writer == nil {
+		return nil
+	}
 
 	var results []Chunk
 	appendMatch := func(c Chunk) bool {
@@ -549,6 +580,9 @@ func (s *DocumentStore) QueryChunks(filter ChunkFilter) []Chunk {
 func (s *DocumentStore) ListDocuments() []Document {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.writer == nil {
+		return nil
+	}
 
 	result := make([]Document, len(s.documents))
 	for i := range s.documents {
@@ -564,6 +598,9 @@ func (s *DocumentStore) ListDocuments() []Document {
 func (s *DocumentStore) AllChunks() []Chunk {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.writer == nil {
+		return nil
+	}
 	result := make([]Chunk, len(s.chunks))
 	for i := range s.chunks {
 		result[i] = cloneChunk(s.chunks[i])
@@ -575,6 +612,9 @@ func (s *DocumentStore) AllChunks() []Chunk {
 func (s *DocumentStore) DocumentCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.writer == nil {
+		return 0
+	}
 	return len(s.documents)
 }
 
@@ -582,6 +622,9 @@ func (s *DocumentStore) DocumentCount() int {
 func (s *DocumentStore) ChunkCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.writer == nil {
+		return 0
+	}
 	return len(s.chunks)
 }
 
@@ -599,6 +642,9 @@ func (s *DocumentStore) DeleteDocument(docID string) error {
 func (s *DocumentStore) DeleteDocumentWithAudit(docID string, authorize func(Document) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, err := s.validateCurrentStatePath(); err != nil {
+		return err
+	}
 
 	documentIndex, ok := s.docIndex[docID]
 	if !ok {
@@ -666,6 +712,9 @@ func (s *DocumentStore) PurgeExpiredWithAudit(authorize func([]Document) error) 
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, err := s.validateCurrentStatePath(); err != nil {
+		return 0, err
+	}
 
 	cutoff := time.Now().UTC().AddDate(0, 0, -s.retention.TTLDays)
 	var expiredIDs []string
@@ -801,6 +850,9 @@ func (s *DocumentStore) persistState(documents []Document, chunks []Chunk) error
 }
 
 func (s *DocumentStore) validateCurrentStatePath() (os.FileInfo, error) {
+	if err := s.writer.Validate(); err != nil {
+		return nil, err
+	}
 	info, err := os.Lstat(s.statePath)
 	if os.IsNotExist(err) {
 		if s.stateInfo != nil {
@@ -824,6 +876,9 @@ func (s *DocumentStore) validateCurrentStatePath() (os.FileInfo, error) {
 }
 
 func (s *DocumentStore) requireUnchangedStatePath(expected os.FileInfo) error {
+	if err := s.writer.Validate(); err != nil {
+		return err
+	}
 	info, err := os.Lstat(s.statePath)
 	if expected == nil {
 		if os.IsNotExist(err) {
@@ -841,8 +896,22 @@ func (s *DocumentStore) requireUnchangedStatePath(expected os.FileInfo) error {
 	return nil
 }
 
-// Close is retained for API compatibility; snapshots do not keep files open.
-func (s *DocumentStore) Close() error { return nil }
+// Ready checks ownership and state identity without releasing any content.
+func (s *DocumentStore) Ready() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, err := s.validateCurrentStatePath()
+	return err
+}
+
+// Close waits for outstanding store operations and releases writer ownership.
+func (s *DocumentStore) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := s.writer.Close()
+	s.writer = nil
+	return err
+}
 
 func validateLabels(labels map[string]string) error {
 	if len(labels) > 64 {

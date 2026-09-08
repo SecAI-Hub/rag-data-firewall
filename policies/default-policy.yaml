@@ -41,13 +41,13 @@ rules:
     action: require-approval
     reason: "restricted documents require explicit operator approval"
 
-  - name: redact-confidential-low-trust
-    description: "Redact PII from confidential docs in low-trust sessions"
+  - name: deny-confidential-low-trust
+    description: "Withhold confidential content in low-trust sessions"
     match:
       sensitivity: [confidential]
       session_trust: [low]
-    action: redact
-    redact_patterns: [email, ssn, phone, credential, credit_card, bearer_token]
+    action: deny
+    reason: "confidential content is not available in low-trust sessions"
 
   - name: allow-confidential-high-trust
     description: "Allow confidential docs for high-trust user sessions"
@@ -57,12 +57,12 @@ rules:
       session_trust: [high]
     action: allow
 
-  - name: redact-confidential-default
-    description: "Redact confidential docs by default"
+  - name: require-approval-confidential
+    description: "Withhold confidential content without an explicit high-trust user grant"
     match:
       sensitivity: [confidential]
-    action: redact
-    redact_patterns: [email, ssn, phone, credential, credit_card, bearer_token]
+    action: require-approval
+    reason: "confidential content requires explicit operator approval"
 
   - name: allow-internal-users
     description: "Internal documents available to users"

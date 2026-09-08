@@ -192,7 +192,7 @@ func readRegularFileWithInfo(path string, maxBytes int64) ([]byte, os.FileInfo, 
 	}
 	// #nosec G304 -- this centralized bounded reader accepts explicit operator
 	// paths and surrounds the open with regular-file and identity checks.
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, nil, err
 	}
